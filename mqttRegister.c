@@ -38,7 +38,7 @@
 // subscribed again on each (re)connect.
 //
 #include <stdbool.h>                                  // bool
-#include <stdio.h>                                    // snprintf
+#include <stdio.h>                                    // snprintf, fopen, fread
 #include <stdlib.h>                                   // strtol, free
 #include <string.h>                                   // strncmp, strchr, strrchr, strlen, strdup
 #include <strings.h>                                  // strcasecmp
@@ -57,7 +57,6 @@
 #include "corJson/corJsonParse.h"                     // corJsonParse
 #include "corTree/CorNode.h"                          // CorNode
 #include "corTree/corTreeLookup.h"                    // corTreeLookup
-#include "corBase/corFileReadInto.h"                  // corFileReadInto
 
 #include "corBridge/BridgeDriver.h"                   // BridgeDriver, BridgeRegisterFunc
 #include "corBridge/BridgeBroker.h"                   // BridgeBroker, BRIDGE_*
@@ -573,6 +572,39 @@ static void onMessage(struct mosquitto* mosq, void* userdata, const struct mosqu
 
 // -----------------------------------------------------------------------------
 //
+// configLoad - the whole --bridgeConfig file, NUL-terminated; malloc'd. NULL: not readable
+//
+// All of it: the file holds every bridge's Channels (the broker takes up to 4 MiB), and a cut-off
+// text does not parse - which read as "no server" and left every Channel dormant.
+//
+static char* configLoad(const char* path)
+{
+  FILE* fP = fopen(path, "r");
+  if (fP == NULL)
+    return NULL;
+
+  char* text = NULL;
+  long  size = (fseek(fP, 0, SEEK_END) == 0) ? ftell(fP) : -1;
+
+  if ((size >= 0) && (fseek(fP, 0, SEEK_SET) == 0) && ((text = malloc(size + 1)) != NULL))
+  {
+    if (fread(text, 1, size, fP) == (size_t) size)
+      text[size] = 0;
+    else
+    {
+      free(text);
+      text = NULL;
+    }
+  }
+
+  fclose(fP);
+  return text;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // serverConfig - the Bridge's connection, from the "mqtt" member of the --bridgeConfig file
 //
 // Returns false when there is no server - a Bridge for notifications only, which is fine - and
@@ -580,13 +612,13 @@ static void onMessage(struct mosquitto* mosq, void* userdata, const struct mosqu
 //
 static bool serverConfig(const char* configFile, MqttUri* uP, char* clientId, int clientIdSize, int* versionP, bool* errorP)
 {
-  static char text[64 * 1024];
-  bool        found = false;
+  char* text  = (configFile != NULL) ? configLoad(configFile) : NULL;
+  bool  found = false;
 
   *errorP   = false;
   *versionP = MQTT_PROTOCOL_V5;
 
-  if ((configFile == NULL) || (corFileReadInto(configFile, text, sizeof(text)) < 0))
+  if (text == NULL)
     return false;
 
   CorAlloc ka;
@@ -653,6 +685,7 @@ static bool serverConfig(const char* configFile, MqttUri* uP, char* clientId, in
   }
 
   corAllocBufferReset(&ka, false);
+  free(text);                                         // after the tree: its strings point into it
   return found;
 }
 
