@@ -66,9 +66,15 @@ FORCE:
 %.o: %.c .flags
 	$(CC) $(CFLAGS) -c $< -o $@
 
+#
+# install - a NEW file, renamed over the installed one: never `cp` onto it. cp rewrites the file in
+# place (the same inode), and a running broker has the plugin mapped (dlopen) - its code changes under
+# the broker, which dies of SIGSEGV or SIGILL within seconds. The rename leaves a running broker the
+# old file; its next start loads the new one.
+#
 install: all
 	mkdir -p $(PLUGIN_DIR)
-	cp -p $(PLUGIN) $(PLUGIN_DIR)/
+	cp -p $(PLUGIN) $(PLUGIN_DIR)/.$(PLUGIN).new && mv -f $(PLUGIN_DIR)/.$(PLUGIN).new $(PLUGIN_DIR)/$(PLUGIN)
 
 di: install
 ci: clean install
