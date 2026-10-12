@@ -240,6 +240,41 @@ static int libInit(void)
 
 // -----------------------------------------------------------------------------
 //
+// PubState / onPublish - libmosquitto's word that the message has gone: written to the socket (QoS 0),
+// acknowledged (QoS 1, PUBACK), completed (QoS 2, PUBCOMP)
+//
+typedef struct PubState
+{
+  int   mid;
+  bool  published;
+  int   barrierMid;                                  // QoS 0: the UNSUBSCRIBE behind the PUBLISH
+  bool  barrierDone;
+} PubState;
+
+static void onPublish(struct mosquitto* mosq, void* obj, int mid)
+{
+  (void) mosq;
+
+  PubState* psP = (PubState*) obj;
+
+  if ((psP != NULL) && (mid == psP->mid))
+    psP->published = true;
+}
+
+static void onUnsubscribe(struct mosquitto* mosq, void* obj, int mid)
+{
+  (void) mosq;
+
+  PubState* psP = (PubState*) obj;
+
+  if ((psP != NULL) && (mid == psP->barrierMid))
+    psP->barrierDone = true;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // mqttNotify - one notification: connect, publish, wait until it has gone, disconnect
 //
 static int mqttNotify(const char* url, const char* payload, const char* info, bool tlsInsecure)
@@ -260,7 +295,8 @@ static int mqttNotify(const char* url, const char* payload, const char* info, bo
   int version;
   infoSettings(info, &qos, &version);
 
-  struct mosquitto* mosq = mosquitto_new(NULL, true, NULL);    // client id generated, clean session
+  PubState          pub  = { -1, false, -1, false };
+  struct mosquitto* mosq = mosquitto_new(NULL, true, &pub);    // client id generated, clean session
   if (mosq == NULL)
   {
     free(u.buf);
@@ -289,45 +325,62 @@ static int mqttNotify(const char* url, const char* payload, const char* info, bo
       }
     }
 
+    mosquitto_publish_callback_set(mosq, onPublish);
+    mosquitto_unsubscribe_callback_set(mosq, onUnsubscribe);
+
     if (mosquitto_connect(mosq, u.host, u.port, 30) != MOSQ_ERR_SUCCESS)
       break;
 
-    if (mosquitto_publish(mosq, NULL, u.topic, strlen(payload), payload, qos, false) != MOSQ_ERR_SUCCESS)
+    if (mosquitto_publish(mosq, &pub.mid, u.topic, strlen(payload), payload, qos, false) != MOSQ_ERR_SUCCESS)
       break;
 
     //
-    // Pump the loop until the message has really gone. want_write going false means CONNECT and
-    // PUBLISH have left the socket - over TLS the handshake alone spans several cycles, so one 100 ms
-    // cycle and a disconnect drops the publish. QoS 0 then gets a few more cycles, or the teardown
-    // races the receiving broker's routing (seen over TLS). QoS 1/2 wait for their acknowledgement.
+    // Pump the loop until libmosquitto says the message has gone (onPublish) - not a guess at it from the
+    // socket: over TLS the handshake ends inside the loop, and until it does the PUBLISH waits in the
+    // queue with nothing to write (want_write false) - a "flushed" that has sent nothing.
     //
-    int msLeft    = 5000;
-    int postFlush = 0;
-
-    while (msLeft > 0)
+    for (int msLeft = 5000; (msLeft > 0) && (pub.published == false); msLeft -= 100)
     {
-      int rc = mosquitto_loop(mosq, 100, 1);
-      if (rc != MOSQ_ERR_SUCCESS)
+      if (mosquitto_loop(mosq, 100, 1) != MOSQ_ERR_SUCCESS)
         break;
+    }
 
-      msLeft -= 100;
+    ok = pub.published;
 
-      if (qos == 0)
+    //
+    // QoS 0 has no acknowledgement: "gone" is only "written". A disconnect then can lose it - over TLS the
+    // broker's session tickets sit unread, closing the socket sends a RST, and the broker discards what it
+    // had received and not yet read: the PUBLISH (an immediate disconnect lost every one). A barrier: an
+    // UNSUBSCRIBE of a topic nobody has, behind the PUBLISH. The broker handles a connection's packets in
+    // order, so its UNSUBACK says the PUBLISH has been routed - and reading it drained what was pending.
+    //
+    if ((ok == true) && (qos == 0))
+    {
+      ok = false;
+
+      if (mosquitto_unsubscribe(mosq, &pub.barrierMid, "$coraine/notify-barrier") == MOSQ_ERR_SUCCESS)
       {
-        if ((mosquitto_want_write(mosq) == false) && (++postFlush >= 3))
+        for (int msLeft = 5000; (msLeft > 0) && (pub.barrierDone == false); msLeft -= 100)
         {
-          ok = true;
-          break;
+          if (mosquitto_loop(mosq, 100, 1) != MOSQ_ERR_SUCCESS)
+            break;
         }
-      }
-      else if (msLeft <= 4500)
-      {
-        ok = true;
-        break;
+
+        ok = pub.barrierDone;
       }
     }
 
+    //
+    // A clean DISCONNECT: the loop pumped until the connection is closed - mosquitto_disconnect only
+    // queues the packet, and destroying the connection right after it sends nothing
+    //
     mosquitto_disconnect(mosq);
+
+    for (int ms = 0; ms < 2000; ms += 100)
+    {
+      if (mosquitto_loop(mosq, 100, 1) != MOSQ_ERR_SUCCESS)   // MOSQ_ERR_NO_CONN: closed
+        break;
+    }
   } while (0);
 
   mosquitto_destroy(mosq);
